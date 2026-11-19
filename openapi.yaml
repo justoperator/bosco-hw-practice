@@ -1,0 +1,661 @@
+openapi: 3.0.3
+info:
+  title: Tournament Scoreboard API
+  version: "2.0.0"
+  description: |
+    Контракт табло живого турніру — ПР №2.17.3 курсу Bosco Backend (День 19).
+
+    Версія 2.0.0 **розширює** контракт ПР №2.16.3 (1.0.0). Усе, що було
+    обіцяно в 1.0.0, лишається дійсним: старий набір тестів має проходити
+    на тому самому коді. Нове в цій версії:
+
+      * фільтри, пошук і сортування списку матчів;
+      * керований розмір сторінки (`page_size`) зі стелею;
+      * **деталі** матчу віддають більше полів, ніж список;
+      * табло вміє другий формат — CSV;
+      * табло віддає **власний** заголовок `X-Poll-After` — підказку,
+        через скільки секунд опитувати його знову;
+      * API доступне з браузера з одного дозволеного origin.
+
+    Цей файл є **джерелом істини**. Якщо ваша реалізація відрізняється від
+    контракту — помиляється реалізація, а не контракт.
+
+    Імпорт у клієнт:
+      * Postman: Import → File → `openapi.yaml` → Generate collection
+      * Insomnium / Insomnia: Import → From File → `openapi.yaml`
+
+    Загальні правила:
+      * усі адреси завершуються слешем;
+      * списки колекцій (`/tournaments/`, `/matches/`) віддаються в конверті
+        `{count, next, previous, results}`, `PAGE_SIZE = 20`;
+      * вкладений список подій і табло віддаються **голим масивом** без конверта;
+      * набір полів у **списку** матчів і в **деталях** матчу різний — це не
+        недогляд, а вимога: список лишається рівно таким, як у версії 1.0.0;
+      * помилка валідації поля → `{"<поле>": ["текст"]}`;
+      * конфлікт стану і «не знайдено» → `{"detail": "...", "code": "..."}`;
+      * жодна помилка не повертається з кодом `200`.
+
+    Порядок перевірок у вкладених ресурсах строго такий: `404` (матч не існує)
+    → `409` (стан матчу не дозволяє дію) → `400` (дані не пройшли валідацію).
+
+    **CORS.** Дозволений рівно один origin — `http://localhost:3000`. OpenAPI
+    не описує CORS: це поведінка браузера, а не формат запиту. Але контракт
+    її вимагає, і перевіряють її тести `test_cors.py`:
+      * відповідь дозволеному origin містить `Access-Control-Allow-Origin`;
+      * відповідь чужому origin його **не** містить, хоча сам запит
+        виконується і повертає `200`;
+      * preflight `OPTIONS` з `Access-Control-Request-Method` отримує відповідь;
+      * `X-Poll-After` перелічений в `Access-Control-Expose-Headers` — інакше
+        браузер не віддасть його JavaScript.
+servers:
+  - url: http://127.0.0.1:8000
+    description: Локальний сервер розробки
+tags:
+  - name: tournaments
+    description: Турніри — лише читання
+  - name: matches
+    description: Матчі — CRUD без повної заміни
+  - name: events
+    description: Події матчу — вкладений ресурс
+  - name: scoreboard
+    description: Зведене табло
+
+paths:
+  /api/v1/tournaments/:
+    get:
+      tags: [tournaments]
+      operationId: listTournaments
+      summary: Список турнірів
+      parameters:
+        - $ref: "#/components/parameters/Page"
+      responses:
+        "200":
+          description: Сторінка списку турнірів
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedTournaments" }
+    post:
+      tags: [tournaments]
+      operationId: createTournamentForbidden
+      summary: Створення турніру не передбачене
+      description: Турніри створює адміністратор. Колекція доступна лише для читання.
+      responses:
+        "405":
+          description: Метод не дозволений
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Detail" }
+
+  /api/v1/tournaments/{slug}/:
+    parameters:
+      - name: slug
+        in: path
+        required: true
+        description: Пошук турніру відбувається за `slug`, а не за `id`.
+        schema: { type: string, example: kubok-it21 }
+    get:
+      tags: [tournaments]
+      operationId: retrieveTournament
+      summary: Турнір за слагом
+      responses:
+        "200":
+          description: Турнір
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tournament" }
+        "404":
+          description: Турніру з таким слагом немає
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Detail" }
+
+  /api/v1/matches/:
+    get:
+      tags: [matches]
+      operationId: listMatches
+      summary: Список матчів
+      description: |
+        Фільтри, пошук і сортування працюють **разом** в одному запиті.
+
+        Набір полів елемента списку — той самий `Match`, що й у версії 1.0.0.
+        Вкладених подій у списку бути не повинно: вони живуть лише в деталях.
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PageSize"
+        - $ref: "#/components/parameters/FilterStatus"
+        - $ref: "#/components/parameters/FilterTournament"
+        - $ref: "#/components/parameters/FilterTeam"
+        - $ref: "#/components/parameters/Search"
+        - $ref: "#/components/parameters/Ordering"
+      responses:
+        "200":
+          description: |
+            Сторінка списку матчів. Без `ordering` — за `starts_at` за
+            зростанням. `page_size` більший за стелю мовчки обмежується до неї.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedMatches" }
+        "400":
+          description: |
+            Недопустиме значення фільтра — наприклад `?status=bogus`.
+            Порожній список тут неприпустимий: клієнт вирішив би, що матчів
+            немає, хоча насправді помилився в запиті.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FieldErrors" }
+              example:
+                status: ["Виберіть коректний варіант. bogus немає серед допустимих значень."]
+        "404":
+          description: Сторінки з таким номером немає
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Detail" }
+    post:
+      tags: [matches]
+      operationId: createMatch
+      summary: Створити матч
+      description: |
+        Поле `status` у тілі запиту **ігнорується**: новий матч завжди
+        створюється зі станом `scheduled`. Відповідь обов'язково містить
+        заголовок `Location` з адресою створеного матчу — DRF не додає його
+        сам, це ваша робота.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MatchWrite" }
+            example:
+              tournament: 1
+              home: 1
+              away: 2
+              starts_at: "2030-01-01T18:00:00Z"
+      responses:
+        "201":
+          description: Матч створено
+          headers:
+            Location:
+              description: Адреса створеного матчу
+              schema: { type: string, example: "http://127.0.0.1:8000/api/v1/matches/17/" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Match" }
+        "400":
+          description: |
+            Дані не пройшли валідацію. Окремий випадок: `home` і `away` — та сама
+            команда, помилка приходить під ключем `away`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FieldErrors" }
+              example:
+                away: ["Команда не може грати сама із собою."]
+        "415":
+          description: |
+            Тіло надіслане у форматі, якого сервер не вміє читати —
+            наприклад `Content-Type: application/xml`. До валідації полів
+            справа не доходить, тому це **не** `400`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Detail" }
+              example:
+                detail: "Unsupported media type \"application/xml\" in request."
+
+  /api/v1/matches/{id}/:
+    parameters:
+      - $ref: "#/components/parameters/MatchId"
+    get:
+      tags: [matches]
+      operationId: retrieveMatch
+      summary: Матч за id — з подіями і посиланням на себе
+      description: |
+        Деталі віддають **більше** полів, ніж список: `url`, `tournament_name`
+        і вкладений масив `events`. Це окремий серіалізатор, а не одне поле
+        більше в наявному: набір полів списку зафіксований версією 1.0.0 і
+        перевіряється точно.
+
+        Вкладені події не повинні коштувати запиту на кожну подію.
+      responses:
+        "200":
+          description: Матч із подіями
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MatchDetail" }
+        "404":
+          description: Матчу немає
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Detail" }
+    put:
+      tags: [matches]
+      operationId: replaceMatchForbidden
+      summary: Повна заміна матчу не передбачена
+      description: |
+        Матч не замінюють цілком — його стан змінюється переходами.
+        `PUT` має віддавати `405`, і це перевіряється тестом.
+      responses:
+        "405":
+          description: Метод не дозволений
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Detail" }
+    patch:
+      tags: [matches]
+      operationId: patchMatch
+      summary: Часткова зміна матчу і перехід стану
+      description: |
+        Дозволені переходи `status`: `scheduled → live` і `live → finished`.
+        Будь-який інший перехід → `409` з кодом `invalid_status_transition`.
+        `PATCH` із тим самим значенням `status` конфліктом не є і дає `200`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MatchPatch" }
+            example: { status: live }
+      responses:
+        "200":
+          description: Матч змінено
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Match" }
+        "400":
+          description: Дані не пройшли валідацію
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FieldErrors" }
+        "404":
+          description: Матчу немає
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Detail" }
+        "409":
+          description: Недопустимий перехід стану
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Conflict" }
+              example:
+                detail: "Перехід finished → live неможливий."
+                code: invalid_status_transition
+    delete:
+      tags: [matches]
+      operationId: deleteMatch
+      summary: Видалити матч
+      description: |
+        Видалити можна лише матч у стані `scheduled`. Матч, який уже почався
+        або завершився, — частина історії турніру: `409` з кодом `match_started`.
+      responses:
+        "204":
+          description: Матч видалено, тіла немає
+        "404":
+          description: Матчу немає
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Detail" }
+        "409":
+          description: Матч уже почався
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Conflict" }
+              example:
+                detail: "Матч уже почався, видалити його не можна."
+                code: match_started
+
+  /api/v1/matches/{id}/events/:
+    parameters:
+      - $ref: "#/components/parameters/MatchId"
+    get:
+      tags: [events]
+      operationId: listMatchEvents
+      summary: Події матчу
+      description: |
+        Віддається **голий масив**, без конверта пагінації — вкладений ресурс
+        не проходить через механізм списків generic-класів. Порядок — за `minute`.
+      responses:
+        "200":
+          description: Події матчу
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Event" }
+        "404":
+          description: Матчу немає
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Detail" }
+    post:
+      tags: [events]
+      operationId: createMatchEvent
+      summary: Додати подію до матчу
+      description: |
+        Подію можна додати **лише до матчу зі станом `live`** — інакше `409`
+        з кодом `match_not_live`. Перевірка стану йде **перед** валідацією тіла.
+        Заголовок `Location` тут не потрібен: окремої адреси події немає.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EventWrite" }
+            example:
+              kind: goal
+              minute: 23
+              player: "Петренко"
+              team: 1
+      responses:
+        "201":
+          description: Подію додано
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Event" }
+        "400":
+          description: |
+            Дані не пройшли валідацію. Два показові випадки: `minute` більша за
+            120 і `team`, яка не грає в цьому матчі.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FieldErrors" }
+              example:
+                team: ["Команда не грає в цьому матчі."]
+        "404":
+          description: Матчу немає
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Detail" }
+        "409":
+          description: Матч не триває
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Conflict" }
+              example:
+                detail: "Події можна додавати лише до матчу, що триває."
+                code: match_not_live
+
+  /api/v1/scoreboard/:
+    get:
+      tags: [scoreboard]
+      operationId: scoreboard
+      summary: Табло — усі матчі, що тривають
+      description: |
+        Голий масив матчів зі станом `live`, упорядкований за `starts_at`.
+        Це один зведений звіт, а не колекція: його місце — `@api_view`, не ViewSet.
+
+        Табло віддається у **двох** форматах. JSON — за замовчуванням; CSV —
+        якщо клієнт попросив його через `?format=csv` **або** через заголовок
+        `Accept: text/csv`. Обидва шляхи мають давати однаковий результат:
+        це і є content negotiation.
+
+        Шапка CSV — рівно така:
+        `home_name,away_name,home_goals,away_goals,starts_at`.
+
+        > Порядок за `starts_at` тут легко загубити: у запиті з агрегацією
+        > Django ігнорує `Meta.ordering`, і без явного `order_by()` рядки
+        > підуть у довільному порядку. На трьох матчах це часто непомітно.
+      parameters:
+        - name: format
+          in: query
+          required: false
+          description: Явний вибір формату замість заголовка `Accept`.
+          schema: { type: string, enum: [json, csv] }
+      responses:
+        "200":
+          description: Матчі, що тривають
+          headers:
+            X-Poll-After:
+              description: |
+                Через скільки **секунд** клієнтові опитувати табло знову.
+                Поки триває хоч один матч — `5`. Якщо не триває жоден —
+                стільки, скільки лишилось до початку найближчого
+                запланованого матчу, у межах від `5` до `300`.
+
+                **Чому це заголовок, а не поле у відповіді.** Тіло відповідає
+                на питання «який рахунок», заголовок — на питання «коли
+                питати знову»: це вказівка клієнтові про користування API,
+                а не дані про матчі. Обчислити це число з тіла **неможливо**:
+                у тілі лише матчі, що тривають, а розклад майбутніх туди не
+                входить.
+
+                **Чому власний, а не стандартний.** Заголовка з таким змістом
+                у HTTP немає: `Retry-After` означає «я зараз не можу тебе
+                обслужити» і йде з `503` або `429`, а тут відповідь цілком
+                успішна. Тому заголовок вигадує автор API — і саме тому
+                браузер із іншого origin ховає його від JavaScript, поки
+                сервер не перелічить його в `CORS_EXPOSE_HEADERS`.
+              schema: { type: string, example: "5" }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Match" }
+            text/csv:
+              schema:
+                type: string
+                example: |
+                  home_name,away_name,home_goals,away_goals,starts_at
+                  Вовки,Орли,1,1,2026-11-10T14:00:00+02:00
+        "406":
+          description: |
+            Клієнт попросив формат, якого сервер не вміє віддавати
+            (наприклад `Accept: application/xml`). За `406` відповідає
+            `Accept`; `415` — навпаки, про тіло запиту.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Detail" }
+
+components:
+  parameters:
+    Page:
+      name: page
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, example: 1 }
+    PageSize:
+      name: page_size
+      in: query
+      required: false
+      description: |
+        Розмір сторінки. Значення, більше за `maximum`, **не** є помилкою —
+        воно мовчки обмежується стелею. Без стелі один запит витягував би всю
+        таблицю, і пагінація перестала б захищати сервер.
+      schema: { type: integer, minimum: 1, maximum: 50, default: 20, example: 5 }
+    FilterStatus:
+      name: status
+      in: query
+      required: false
+      description: Фільтр за станом матчу. Невідоме значення → `400`.
+      schema: { $ref: "#/components/schemas/MatchStatus" }
+    FilterTournament:
+      name: tournament
+      in: query
+      required: false
+      description: Фільтр за id турніру.
+      schema: { type: integer, example: 1 }
+    FilterTeam:
+      name: team
+      in: query
+      required: false
+      description: |
+        Матчі команди — і домашні, і виїзні. Тобто `home = id` **або**
+        `away = id`, а не фільтр по одному полю.
+      schema: { type: integer, example: 1 }
+    Search:
+      name: search
+      in: query
+      required: false
+      description: |
+        Пошук за назвами команд (`home__name`, `away__name`). Нічого не
+        знайшлось — це порожній список і `200`, а не помилка: запит був
+        коректний, збігів немає.
+      schema: { type: string, example: "Сок" }
+    Ordering:
+      name: ordering
+      in: query
+      required: false
+      description: Сортування. Мінус перед полем — за спаданням.
+      schema:
+        type: string
+        enum: [starts_at, -starts_at, status, -status]
+        example: -starts_at
+    MatchId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, example: 1 }
+
+  schemas:
+    Tournament:
+      type: object
+      required: [id, slug, name, starts_on, matches_count]
+      properties:
+        id: { type: integer, readOnly: true, example: 1 }
+        slug: { type: string, example: kubok-it21 }
+        name: { type: string, example: "Кубок ІТ-21" }
+        starts_on: { type: string, format: date, example: "2026-11-10" }
+        matches_count: { type: integer, readOnly: true, example: 3 }
+
+    Score:
+      type: object
+      required: [home, away]
+      description: Рахунок, порахований із подій типу `goal`. Лише читання.
+      properties:
+        home: { type: integer, example: 2 }
+        away: { type: integer, example: 1 }
+
+    MatchStatus:
+      type: string
+      enum: [scheduled, live, finished]
+
+    Match:
+      type: object
+      description: |
+        Набір полів у відповіді перевіряється точно: ні зайвих, ні пропущених.
+      required: [id, tournament, home, away, home_name, away_name, starts_at, status, score]
+      properties:
+        id: { type: integer, readOnly: true, example: 1 }
+        tournament: { type: integer, example: 1 }
+        home: { type: integer, description: id команди господарів, example: 1 }
+        away: { type: integer, description: id команди гостей, example: 2 }
+        home_name: { type: string, readOnly: true, example: "Соколи" }
+        away_name: { type: string, readOnly: true, example: "Леви" }
+        starts_at: { type: string, format: date-time, example: "2026-11-10T10:00:00Z" }
+        status: { $ref: "#/components/schemas/MatchStatus" }
+        score: { $ref: "#/components/schemas/Score" }
+
+    MatchDetail:
+      type: object
+      description: |
+        Матч у деталях: усі поля `Match` плюс три нові. Набір перевіряється
+        точно, як і в списку, — але набори **різні**, і це навмисно.
+      required:
+        [id, tournament, home, away, home_name, away_name, starts_at, status,
+         score, url, tournament_name, events]
+      properties:
+        id: { type: integer, readOnly: true, example: 1 }
+        tournament: { type: integer, example: 1 }
+        home: { type: integer, example: 1 }
+        away: { type: integer, example: 2 }
+        home_name: { type: string, readOnly: true, example: "Соколи" }
+        away_name: { type: string, readOnly: true, example: "Леви" }
+        starts_at: { type: string, format: date-time, example: "2026-11-10T10:00:00Z" }
+        status: { $ref: "#/components/schemas/MatchStatus" }
+        score: { $ref: "#/components/schemas/Score" }
+        url:
+          type: string
+          readOnly: true
+          description: |
+            Абсолютна адреса самого матчу. Це те саме поле, через яке DRF
+            ставить `Location` до `201` самостійно — але додати його в
+            серіалізатор **списку** не можна: набір полів списку зафіксовано
+            версією 1.0.0. Тому `Location` у `POST` лишається ручним.
+          example: "http://127.0.0.1:8000/api/v1/matches/1/"
+        tournament_name: { type: string, readOnly: true, example: "Кубок ІТ-21" }
+        events:
+          type: array
+          readOnly: true
+          description: Події матчу за зростанням хвилини.
+          items: { $ref: "#/components/schemas/Event" }
+
+    MatchWrite:
+      type: object
+      required: [tournament, home, away, starts_at]
+      properties:
+        tournament: { type: integer, example: 1 }
+        home: { type: integer, example: 1 }
+        away: { type: integer, example: 2 }
+        starts_at: { type: string, format: date-time, example: "2030-01-01T18:00:00Z" }
+
+    MatchPatch:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/MatchStatus" }
+        starts_at: { type: string, format: date-time }
+        home: { type: integer }
+        away: { type: integer }
+
+    EventKind:
+      type: string
+      enum: [goal, card, sub]
+
+    Event:
+      type: object
+      required: [id, kind, minute, player, team, team_name]
+      properties:
+        id: { type: integer, readOnly: true, example: 1 }
+        kind: { $ref: "#/components/schemas/EventKind" }
+        minute: { type: integer, minimum: 0, maximum: 120, example: 23 }
+        player: { type: string, example: "Петренко" }
+        team: { type: integer, description: "id команди, що грає в цьому матчі", example: 1 }
+        team_name: { type: string, readOnly: true, example: "Соколи" }
+
+    EventWrite:
+      type: object
+      required: [kind, minute, player, team]
+      properties:
+        kind: { $ref: "#/components/schemas/EventKind" }
+        minute: { type: integer, minimum: 0, maximum: 120, example: 23 }
+        player: { type: string, example: "Петренко" }
+        team: { type: integer, example: 1 }
+
+    PaginatedTournaments:
+      type: object
+      required: [count, next, previous, results]
+      properties:
+        count: { type: integer, example: 1 }
+        next: { type: string, nullable: true, example: null }
+        previous: { type: string, nullable: true, example: null }
+        results:
+          type: array
+          items: { $ref: "#/components/schemas/Tournament" }
+
+    PaginatedMatches:
+      type: object
+      required: [count, next, previous, results]
+      properties:
+        count: { type: integer, example: 3 }
+        next: { type: string, nullable: true, example: null }
+        previous: { type: string, nullable: true, example: null }
+        results:
+          type: array
+          items: { $ref: "#/components/schemas/Match" }
+
+    Detail:
+      type: object
+      required: [detail]
+      properties:
+        detail: { type: string, example: "Не знайдено." }
+
+    Conflict:
+      type: object
+      required: [detail, code]
+      description: Конфлікт стану. `code` — машинозчитувана причина.
+      properties:
+        detail: { type: string }
+        code:
+          type: string
+          enum: [invalid_status_transition, match_started, match_not_live]
+
+    FieldErrors:
+      type: object
+      description: |
+        Помилки валідації — словник «поле → список текстів», як їх віддає DRF.
+      additionalProperties:
+        type: array
+        items: { type: string }
